@@ -5,6 +5,7 @@ FastAPI + Twilio WhatsApp Dispatcher
 """
 
 from fastapi import FastAPI, Request, HTTPException
+from pydantic import BaseModel, ValidationError
 from twilio.rest import Client
 from datetime import datetime
 import os
@@ -27,6 +28,17 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Parking Valet Geneva — Dispatch API", version="2.0")
 
+
+# ─────────────────────────────────────────
+# PYDANTIC MODELS
+# ─────────────────────────────────────────
+
+class NotifyArguments(BaseModel):
+    name: str = "Unknown"
+    booking_id: str = "Unknown"
+    pax_count: int = 0
+    luggage_ready: bool = True
+    meeting_point: bool = True
 
 # ─────────────────────────────────────────
 # ENVIRONMENT VARIABLES
@@ -135,10 +147,15 @@ async def notify_operations(request: Request):
 
     # ── 1. Parse JSON body ──
     try:
+        raw_body = await request.body()
+        if not raw_body:
+            logger.warning("Received empty POST body. Ignoring.")
+            return {"status": "ignored"}
+            
         data = await request.json()
         logger.info(f"Incoming payload: {data}")
     except Exception as e:
-        logger.error(f"JSON parse error: {e}")
+        logger.error(f"JSON parse error: {e}. Raw body: {raw_body}")
         raise HTTPException(status_code=400, detail="Invalid JSON request")
 
     # ── 2. Extract tool call from Vapi payload ──
@@ -162,30 +179,25 @@ async def notify_operations(request: Request):
 
     logger.info(f"Processing tool call: {tool_call_id}")
 
-    # ── 4. Extract arguments with safe defaults ──
+    # ── 4. Parse arguments using Pydantic ──
     try:
-        name          = str(args.get("name", "Unknown")).strip()
-        booking_id    = str(args.get("booking_id", "Unknown")).strip().upper()
-        pax_count     = int(args.get("pax_count", 0))
-        luggage_ready = bool(args.get("luggage_ready", True))
-        meeting_point = bool(args.get("meeting_point", True))
-        timestamp     = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    except Exception as e:
-        logger.error(f"Argument parsing error: {e}")
-        raise HTTPException(status_code=422, detail="Could not parse arguments")
+        notify_args = NotifyArguments(**args)
+    except ValidationError as e:
+        logger.error(f"Pydantic validation error: {e}")
+        raise HTTPException(status_code=422, detail="Invalid arguments format")
 
     logger.info(
-        f"Dispatching | Name: {name} | Booking: {booking_id} | "
-        f"Pax: {pax_count} | Luggage: {luggage_ready} | Meeting Point: {meeting_point}"
+        f"Dispatching | Name: {notify_args.name} | Booking: {notify_args.booking_id} | "
+        f"Pax: {notify_args.pax_count} | Luggage: {notify_args.luggage_ready} | Meeting Point: {notify_args.meeting_point}"
     )
 
     # ── 5. Warn if required fields are missing ──
     warnings = []
-    if name == "Unknown":
+    if notify_args.name == "Unknown":
         warnings.append("name is Unknown")
-    if booking_id == "UNKNOWN":
+    if notify_args.booking_id.upper() == "UNKNOWN":
         warnings.append("booking_id is Unknown")
-    if pax_count == 0:
+    if notify_args.pax_count == 0:
         warnings.append("pax_count is 0")
 
     if warnings:
@@ -193,12 +205,12 @@ async def notify_operations(request: Request):
 
     # ── 6. Build and send WhatsApp message ──
     message = build_whatsapp_message(
-        name=name,
-        booking_id=booking_id,
-        pax_count=pax_count,
-        luggage_ready=luggage_ready,
-        meeting_point=meeting_point,
-        timestamp=timestamp,
+        name=notify_args.name,
+        booking_id=notify_args.booking_id.upper(),
+        pax_count=notify_args.pax_count,
+        luggage_ready=notify_args.luggage_ready,
+        meeting_point=notify_args.meeting_point,
+        timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
     sent = send_whatsapp(message)
